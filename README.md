@@ -2,7 +2,7 @@
 title: Content Moderation OpenEnv
 emoji: 🛡️
 colorFrom: red
-colorTo: orange
+colorTo: blue
 sdk: docker
 pinned: false
 license: mit
