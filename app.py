@@ -1,19 +1,27 @@
 """
 FastAPI server exposing the ContentModerationEnv as an HTTP API.
 Endpoints: POST /reset, POST /step, GET /state, GET /tasks, GET /health
+
+Hardened for OpenEnv validator:
+- POST /reset accepts no body, empty body {}, or {"task": "easy"}
+- All endpoints return 200 with valid JSON on the happy path
+- Startup errors are caught and reported cleanly
 """
 
 from __future__ import annotations
 
 import os
+import traceback
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from env.environment import ContentModerationEnv
-from env.models import ModerationAction
+# ---------------------------------------------------------------------------
+# App setup (before any env imports so server always starts)
+# ---------------------------------------------------------------------------
 
 app = FastAPI(
     title="Content Moderation OpenEnv",
@@ -33,8 +41,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Single shared environment instance (stateful per session)
-_env = ContentModerationEnv()
+# ---------------------------------------------------------------------------
+# Lazy-load the environment so import errors don't kill the server
+# ---------------------------------------------------------------------------
+
+_env = None
+_env_error: Optional[str] = None
+
+
+def get_env():
+    global _env, _env_error
+    if _env is not None:
+        return _env
+    try:
+        from env.environment import ContentModerationEnv
+        _env = ContentModerationEnv()
+        return _env
+    except Exception as exc:
+        _env_error = traceback.format_exc()
+        raise HTTPException(status_code=500, detail=f"Env init failed: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -42,11 +67,11 @@ _env = ContentModerationEnv()
 # ---------------------------------------------------------------------------
 
 class ResetRequest(BaseModel):
-    task: str = "easy"   # "easy" | "medium" | "hard"
+    task: Optional[str] = "easy"   # "easy" | "medium" | "hard"
 
 
 class StepRequest(BaseModel):
-    action: ModerationAction
+    action: Dict[str, Any]
 
 
 class StepResponse(BaseModel):
@@ -57,68 +82,134 @@ class StepResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Global exception handler — always return JSON, never HTML 500
+# ---------------------------------------------------------------------------
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={"error": str(exc), "type": type(exc).__name__},
+    )
+
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
 @app.get("/health")
-def health() -> Dict[str, str]:
-    return {"status": "ok", "env_id": ContentModerationEnv.ENV_ID}
+def health() -> Dict[str, Any]:
+    return {"status": "ok", "env_id": "content-moderation-v1", "version": "1.0.0"}
 
 
 @app.get("/tasks")
 def list_tasks() -> Dict[str, Any]:
-    from env.tasks import ALL_TASKS
-    return {
-        k: {
-            "task_id":     v["task_id"],
-            "difficulty":  v["difficulty"],
-            "description": v["description"],
-            "num_items":   len(v["items"]),
+    try:
+        from env.tasks import ALL_TASKS
+        return {
+            k: {
+                "task_id":     v["task_id"],
+                "difficulty":  v["difficulty"],
+                "description": v["description"],
+                "num_items":   len(v["items"]),
+            }
+            for k, v in ALL_TASKS.items()
         }
-        for k, v in ALL_TASKS.items()
-    }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.post("/reset")
-def reset(req: ResetRequest) -> Dict[str, Any]:
+async def reset(request: Request) -> Dict[str, Any]:
+    """
+    Reset the environment.
+    Accepts: no body, empty body {}, or {"task": "easy"|"medium"|"hard"}
+    Always returns a valid observation dict.
+    """
+    # Parse body leniently — validator may send no body or empty JSON
+    task = "easy"  # safe default
     try:
-        obs = _env.reset(task=req.task)
+        body_bytes = await request.body()
+        if body_bytes and body_bytes.strip() not in (b"", b"{}"):
+            import json
+            body = json.loads(body_bytes)
+            task = body.get("task", "easy") or "easy"
+    except Exception:
+        task = "easy"
+
+    # Validate task name
+    if task not in ("easy", "medium", "hard"):
+        task = "easy"
+
+    try:
+        env = get_env()
+        obs = env.reset(task=task)
         return obs.dict()
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Reset failed: {exc}")
 
 
 @app.post("/step")
-def step(req: StepRequest) -> StepResponse:
+async def step(request: Request) -> StepResponse:
+    """Submit one moderation action."""
     try:
-        obs, reward, done, info = _env.step(req.action)
+        body_bytes = await request.body()
+        import json
+        body = json.loads(body_bytes)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid JSON body: {exc}")
+
+    # Accept both {"action": {...}} and flat {...}
+    action_data = body.get("action", body)
+
+    try:
+        from env.models import ModerationAction
+        action = ModerationAction(**action_data)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid action: {exc}")
+
+    try:
+        env = get_env()
+        obs, reward, done, info = env.step(action)
         return StepResponse(
             observation=obs.dict(),
             reward=reward,
             done=done,
             info=info,
         )
-    except RuntimeError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Step failed: {exc}")
 
 
 @app.get("/state")
 def state() -> Dict[str, Any]:
-    return _env.state()
+    try:
+        return get_env().state()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.get("/")
 def root() -> Dict[str, Any]:
     return {
-        "name": "Content Moderation OpenEnv",
+        "name":    "Content Moderation OpenEnv",
         "version": "1.0.0",
-        "env_id": ContentModerationEnv.ENV_ID,
-        "tasks": ["easy", "medium", "hard"],
+        "env_id":  "content-moderation-v1",
+        "tasks":   ["easy", "medium", "hard"],
         "endpoints": {
             "reset": "POST /reset",
             "step":  "POST /step",
             "state": "GET /state",
             "tasks": "GET /tasks",
+            "health":"GET /health",
             "docs":  "GET /docs",
         },
     }
