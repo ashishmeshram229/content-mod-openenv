@@ -123,23 +123,21 @@ def list_tasks() -> Dict[str, Any]:
 async def reset(request: Request) -> Dict[str, Any]:
     """
     Reset the environment.
-    Accepts: no body, empty body {}, or {"task": "easy"|"medium"|"hard"}
-    Always returns a valid observation dict.
+    Accepts ANY body: null, no body, empty {}, or {"task": "easy"|"medium"|"hard"}
+    The validator sends a null body — this handler never rejects on body format.
     """
-    # Parse body leniently — validator may send no body or empty JSON
-    task = "easy"  # safe default
+    task = "easy"  # always-safe default
     try:
-        body_bytes = await request.body()
-        if body_bytes and body_bytes.strip() not in (b"", b"{}"):
-            import json
-            body = json.loads(body_bytes)
-            task = body.get("task", "easy") or "easy"
+        raw = await request.body()
+        if raw and len(raw.strip()) > 2:   # more than just "{}" or ""
+            import json as _json
+            data = _json.loads(raw.decode("utf-8", errors="ignore"))
+            if isinstance(data, dict):
+                t = data.get("task") or data.get("task_id") or "easy"
+                if t in ("easy", "medium", "hard"):
+                    task = t
     except Exception:
-        task = "easy"
-
-    # Validate task name
-    if task not in ("easy", "medium", "hard"):
-        task = "easy"
+        pass   # any parse failure → stay with "easy"
 
     try:
         env = get_env()
