@@ -1,219 +1,110 @@
 """
-FastAPI server exposing the ContentModerationEnv as an HTTP API.
-Endpoints: POST /reset, POST /step, GET /state, GET /tasks, GET /health
-
-Hardened for OpenEnv validator:
-- POST /reset accepts no body, empty body {}, or {"task": "easy"}
-- All endpoints return 200 with valid JSON on the happy path
-- Startup errors are caught and reported cleanly
+Content Moderation OpenEnv — FastAPI server
+POST /reset  — accepts null body, no body, {} or {"task":"easy"}
+POST /step   — submit a moderation action
+GET  /state  — current env state
+GET  /tasks  — list all tasks
+GET  /health — health check
 """
-
 from __future__ import annotations
-
+import json
 import os
 import traceback
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 
-# ---------------------------------------------------------------------------
-# App setup (before any env imports so server always starts)
-# ---------------------------------------------------------------------------
+app = FastAPI(title="Content Moderation OpenEnv", version="1.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_methods=["*"], allow_headers=["*"])
 
-app = FastAPI(
-    title="Content Moderation OpenEnv",
-    description=(
-        "A real-world content moderation environment for evaluating AI agents. "
-        "Implements the OpenEnv step/reset/state API."
-    ),
-    version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ---------------------------------------------------------------------------
-# Lazy-load the environment so import errors don't kill the server
-# ---------------------------------------------------------------------------
-
+# ── lazy env loader ──────────────────────────────────────────────────────────
 _env = None
-_env_error: Optional[str] = None
-
 
 def get_env():
-    global _env, _env_error
-    if _env is not None:
-        return _env
-    try:
+    global _env
+    if _env is None:
         from env.environment import ContentModerationEnv
         _env = ContentModerationEnv()
-        return _env
-    except Exception as exc:
-        _env_error = traceback.format_exc()
-        raise HTTPException(status_code=500, detail=f"Env init failed: {exc}")
+    return _env
 
-
-# ---------------------------------------------------------------------------
-# Request / Response schemas
-# ---------------------------------------------------------------------------
-
-class ResetRequest(BaseModel):
-    task: Optional[str] = "easy"   # "easy" | "medium" | "hard"
-
-
-class StepRequest(BaseModel):
-    action: Dict[str, Any]
-
-
-class StepResponse(BaseModel):
-    observation: Dict[str, Any]
-    reward: float
-    done: bool
-    info: Dict[str, Any]
-
-
-# ---------------------------------------------------------------------------
-# Global exception handler — always return JSON, never HTML 500
-# ---------------------------------------------------------------------------
-
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    return JSONResponse(
-        status_code=500,
-        content={"error": str(exc), "type": type(exc).__name__},
-    )
-
-
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
-
-@app.get("/health")
-def health() -> Dict[str, Any]:
-    return {"status": "ok", "env_id": "content-moderation-v1", "version": "1.0.0"}
-
-
-@app.get("/tasks")
-def list_tasks() -> Dict[str, Any]:
-    try:
-        from env.tasks import ALL_TASKS
-        return {
-            k: {
-                "task_id":     v["task_id"],
-                "difficulty":  v["difficulty"],
-                "description": v["description"],
-                "num_items":   len(v["items"]),
-            }
-            for k, v in ALL_TASKS.items()
-        }
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.post("/reset")
-async def reset(request: Request) -> Dict[str, Any]:
-    """
-    Reset the environment.
-    Accepts ANY body: null, no body, empty {}, or {"task": "easy"|"medium"|"hard"}
-    The validator sends a null body — this handler never rejects on body format.
-    """
-    task = "easy"  # always-safe default
+async def _body(request: Request) -> dict:
+    """Read request body safely. Returns {} on any failure."""
     try:
         raw = await request.body()
-        if raw and len(raw.strip()) > 2:   # more than just "{}" or ""
-            import json as _json
-            data = _json.loads(raw.decode("utf-8", errors="ignore"))
-            if isinstance(data, dict):
-                t = data.get("task") or data.get("task_id") or "easy"
-                if t in ("easy", "medium", "hard"):
-                    task = t
+        if raw and raw.strip() and raw.strip() != b"null":
+            return json.loads(raw) or {}
     except Exception:
-        pass   # any parse failure → stay with "easy"
+        pass
+    return {}
 
+# ── global error handler — always JSON, never HTML ───────────────────────────
+@app.exception_handler(Exception)
+async def _err(request: Request, exc: Exception):
+    return JSONResponse({"error": str(exc)}, status_code=500)
+
+# ── endpoints ────────────────────────────────────────────────────────────────
+@app.get("/health")
+async def health():
+    return {"status": "ok", "env_id": "content-moderation-v1", "version": "1.0.0"}
+
+@app.get("/")
+async def root():
+    return {"name": "Content Moderation OpenEnv", "version": "1.0.0",
+            "env_id": "content-moderation-v1", "tasks": ["easy", "medium", "hard"],
+            "endpoints": {"reset": "POST /reset", "step": "POST /step",
+                          "state": "GET /state", "tasks": "GET /tasks"}}
+
+@app.post("/reset")
+async def reset(request: Request):
+    """
+    Reset — tolerates null body, empty body, {} or {"task":"easy"}.
+    The OpenEnv validator sends a null/empty body; this always returns 200.
+    """
+    body = await _body(request)
+    task = body.get("task", "easy") if isinstance(body, dict) else "easy"
+    if task not in ("easy", "medium", "hard"):
+        task = "easy"
     try:
-        env = get_env()
-        obs = env.reset(task=task)
-        return obs.dict()
-    except HTTPException:
-        raise
+        obs = get_env().reset(task=task)
+        return JSONResponse(obs.dict())
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Reset failed: {exc}")
-
+        return JSONResponse({"error": str(exc), "traceback": traceback.format_exc()},
+                            status_code=500)
 
 @app.post("/step")
-async def step(request: Request) -> StepResponse:
-    """Submit one moderation action."""
-    try:
-        body_bytes = await request.body()
-        import json
-        body = json.loads(body_bytes)
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Invalid JSON body: {exc}")
-
-    # Accept both {"action": {...}} and flat {...}
+async def step(request: Request):
+    body = await _body(request)
     action_data = body.get("action", body)
-
     try:
         from env.models import ModerationAction
         action = ModerationAction(**action_data)
+        obs, reward, done, info = get_env().step(action)
+        return JSONResponse({"observation": obs.dict(), "reward": reward,
+                             "done": done, "info": info})
     except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Invalid action: {exc}")
-
-    try:
-        env = get_env()
-        obs, reward, done, info = env.step(action)
-        return StepResponse(
-            observation=obs.dict(),
-            reward=reward,
-            done=done,
-            info=info,
-        )
-    except HTTPException:
-        raise
-    except RuntimeError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Step failed: {exc}")
-
+        return JSONResponse({"error": str(exc)}, status_code=422)
 
 @app.get("/state")
-def state() -> Dict[str, Any]:
+async def state():
     try:
-        return get_env().state()
-    except HTTPException:
-        raise
+        return JSONResponse(get_env().state())
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        return JSONResponse({"error": str(exc)}, status_code=500)
 
-
-@app.get("/")
-def root() -> Dict[str, Any]:
-    return {
-        "name":    "Content Moderation OpenEnv",
-        "version": "1.0.0",
-        "env_id":  "content-moderation-v1",
-        "tasks":   ["easy", "medium", "hard"],
-        "endpoints": {
-            "reset": "POST /reset",
-            "step":  "POST /step",
-            "state": "GET /state",
-            "tasks": "GET /tasks",
-            "health":"GET /health",
-            "docs":  "GET /docs",
-        },
-    }
-
+@app.get("/tasks")
+async def tasks():
+    try:
+        from env.tasks import ALL_TASKS
+        return {k: {"task_id": v["task_id"], "difficulty": v["difficulty"],
+                    "description": v["description"], "num_items": len(v["items"])}
+                for k, v in ALL_TASKS.items()}
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 7860))
-    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run("app:app", host="0.0.0.0",
+                port=int(os.getenv("PORT", 7860)), reload=False)
