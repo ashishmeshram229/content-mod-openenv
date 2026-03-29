@@ -1,7 +1,3 @@
-"""
-server/app.py — Required by openenv validate for multi-mode deployment.
-Must expose a callable main() function with if __name__ == '__main__' block.
-"""
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
