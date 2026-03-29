@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.scripts]
-serve = "server.app:main"
+server = "server.app:main"
 
 [tool.openenv]
 env_id = "content-moderation-v1"
