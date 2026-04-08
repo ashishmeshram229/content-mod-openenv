@@ -1,0 +1,100 @@
+name: content-moderation-v1
+version: "1.0.0"
+description: >
+  A real-world content moderation environment where an AI agent must
+  review user-generated content and make policy enforcement decisions.
+  Simulates the exact workflow used by trust & safety teams at major
+  platforms: classify violations, assess severity, choose the right
+  enforcement action (approve, remove, escalate, warn, age-restrict,
+  shadow-ban), and apply policies consistently across a queue of items.
+
+tags:
+  - openenv
+  - content-moderation
+  - trust-and-safety
+  - nlp
+  - classification
+  - real-world
+
+author: "OpenEnv Hackathon Submission"
+license: MIT
+
+env:
+  id: content-moderation-v1
+  type: text
+  observation_space:
+    type: object
+    schema: ModerationObservation
+  action_space:
+    type: object
+    schema: ModerationAction
+  reward_range: [-1.0, 1.0]
+  max_steps: 50
+
+tasks:
+  - id: task_easy_001
+    name: Clear-cut Moderation
+    difficulty: easy
+    num_items: 10
+    description: >
+      Clear violations and clearly benign content. Spam bots, obvious
+      hate speech, and safe posts. Expected accuracy: ≥0.90.
+    grader: env.grader.grade_easy
+
+  - id: task_medium_001
+    name: Contextual Moderation
+    difficulty: medium
+    num_items: 12
+    description: >
+      Ambiguous cases: satire vs. hate, journalism vs. glorification,
+      crisis signals, unverified claims. Expected accuracy: ≥0.75.
+    grader: env.grader.grade_medium
+
+  - id: task_hard_001
+    name: Adversarial Moderation
+    difficulty: hard
+    num_items: 15
+    description: >
+      Adversarial evasion techniques, coded language, policy conflicts,
+      verified-user misinformation, and banned-user appeals.
+      Expected accuracy: ≥0.65.
+    grader: env.grader.grade_hard
+
+reward:
+  type: shaped
+  components:
+    - name: decision_correctness
+      weight: 0.60
+      description: Correctness of the enforcement decision
+    - name: category_accuracy
+      weight: 0.25
+      description: Correct identification of violation category
+    - name: severity_accuracy
+      weight: 0.15
+      description: Correct severity assessment
+    - name: efficiency_bonus
+      weight: 0.10
+      description: Bonus for not over-escalating benign content
+    - name: consistency_bonus
+      weight: 0.05
+      description: Bonus for applying consistent policy across similar violations
+    - name: miss_critical_penalty
+      description: Heavy penalty for approving critical/self-harm content
+
+endpoints:
+  reset: POST /reset
+  step:  POST /step
+  state: GET  /state
+  tasks: GET  /tasks
+  docs:  GET  /docs
+
+docker:
+  base_image: python:3.11-slim
+  port: 7860
+  healthcheck: GET /health
+
+huggingface:
+  space_sdk: docker
+  tags:
+    - openenv
+    - content-moderation
