@@ -10,18 +10,59 @@ import os
 import textwrap
 import time
 import urllib.request
-from openai import OpenAI
+import urllib.error
 
-API_BASE_URL = os.environ["API_BASE_URL"]
-API_KEY      = os.environ["API_KEY"]
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
+API_KEY      = os.environ.get("API_KEY", os.environ.get("HF_TOKEN", "hf_placeholder"))
 MODEL_NAME   = os.environ.get("MODEL_NAME", "meta-llama/Llama-3.3-70B-Instruct")
 ENV_URL      = os.environ.get("ENV_BASE_URL", "https://heist-content-mod-openenv.hf.space")
 TEMPERATURE  = 0.0
 MAX_TOKENS   = 512
 TASKS        = ["easy", "medium", "hard"]
 
-client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+print(f"[INFO] API_BASE_URL={API_BASE_URL}", flush=True)
+print(f"[INFO] MODEL={MODEL_NAME}", flush=True)
+print(f"[INFO] ENV={ENV_URL}", flush=True)
 
+# ---------------------------------------------------------------------------
+# LLM via raw HTTP — no openai SDK dependency issues
+# ---------------------------------------------------------------------------
+def call_llm_raw(prompt, system):
+    """Call LLM directly via urllib — no SDK, no httpx version issues."""
+    url  = API_BASE_URL.rstrip("/") + "/chat/completions"
+    body = json.dumps({
+        "model": MODEL_NAME,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": prompt}
+        ],
+        "temperature": TEMPERATURE,
+        "max_tokens": MAX_TOKENS,
+    }).encode()
+    req = urllib.request.Request(
+        url, data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {API_KEY}",
+        },
+        method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = json.loads(r.read())
+            return data["choices"][0]["message"]["content"] or ""
+    except urllib.error.HTTPError as e:
+        print(f"  [LLM HTTP ERROR] {e.code}: {e.read()[:200]}", flush=True)
+        return ""
+    except Exception as e:
+        print(f"  [LLM ERROR] {e}", flush=True)
+        return ""
+
+# ---------------------------------------------------------------------------
+# Structured output blocks — required by Phase 2 validator
+# ---------------------------------------------------------------------------
 def log_start(task):
     print(f"[START] task={task}", flush=True)
 
@@ -31,6 +72,9 @@ def log_step(task, step, reward, done):
 def log_end(task, score, steps):
     print(f"[END] task={task} score={score:.4f} steps={steps}", flush=True)
 
+# ---------------------------------------------------------------------------
+# Env HTTP helpers
+# ---------------------------------------------------------------------------
 def _post(path, body):
     data = json.dumps(body).encode()
     req  = urllib.request.Request(
@@ -43,6 +87,9 @@ def _get(path):
     with urllib.request.urlopen(ENV_URL.rstrip("/") + path, timeout=30) as r:
         return json.loads(r.read())
 
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
 SYSTEM = textwrap.dedent("""
 You are an expert content moderator. Respond with ONLY valid JSON:
 {
@@ -72,15 +119,6 @@ def build_prompt(obs):
             f"queue: {obs.get('queue_position')}/{obs.get('queue_total')}\n"
             f"rules:\n{rules}\nJSON only.")
 
-def call_llm(prompt):
-    r = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[{"role": "system", "content": SYSTEM},
-                  {"role": "user",   "content": prompt}],
-        temperature=TEMPERATURE,
-        max_tokens=MAX_TOKENS)
-    return r.choices[0].message.content or ""
-
 def parse_action(text, content_id):
     try:
         t = text.strip()
@@ -100,6 +138,9 @@ def parse_action(text, content_id):
                 "confidence": 0.1, "reasoning": "parse error",
                 "policy_rule_cited": None, "escalation_note": None}
 
+# ---------------------------------------------------------------------------
+# Run one task
+# ---------------------------------------------------------------------------
 def run_task(task_name):
     log_start(task_name)
     obs = _post("/reset", {"task": task_name})
@@ -108,7 +149,7 @@ def run_task(task_name):
     episode_result = {}
     while True:
         cid    = obs["content"]["content_id"]
-        text   = call_llm(build_prompt(obs))
+        text   = call_llm_raw(build_prompt(obs), SYSTEM)
         action = parse_action(text, cid)
         result = _post("/step", {"action": action})
         obs    = result["observation"]
@@ -129,10 +170,10 @@ def run_task(task_name):
             "total_reward": round(total_reward, 4),
             "episode_result": episode_result}
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 def main():
-    print(f"[INFO] API_BASE_URL={API_BASE_URL}", flush=True)
-    print(f"[INFO] MODEL={MODEL_NAME}", flush=True)
-    print(f"[INFO] ENV={ENV_URL}", flush=True)
     try:
         h = _get("/health")
         print(f"[INFO] Env health: {h.get('status','unknown')}", flush=True)
@@ -142,7 +183,14 @@ def main():
     results = []
     t0 = time.time()
     for task in TASKS:
-        results.append(run_task(task))
+        try:
+            results.append(run_task(task))
+        except Exception as e:
+            print(f"[ERROR] Task {task}: {e}", flush=True)
+            log_start(task)
+            log_end(task, 0.0, 0)
+            results.append({"task": task, "final_score": 0.0,
+                            "accuracy": 0.0, "correct": 0, "total": 0})
 
     elapsed = time.time() - t0
     avg = sum(r.get("final_score", 0) for r in results) / len(results)
@@ -155,6 +203,7 @@ def main():
     with open("baseline_results.json", "w") as f:
         json.dump(output, f, indent=2, default=str)
     print("[INFO] Saved baseline_results.json", flush=True)
+
 
 if __name__ == "__main__":
     main()
